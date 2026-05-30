@@ -49,9 +49,24 @@ ALLOWED_CHAT_ID = str(ENV.get("ALLOWED_CHAT_ID", "")).strip()
 WORKDIR = ENV.get("WORKDIR") or HERE
 CLAUDE_BIN = ENV.get("CLAUDE_BIN") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 PERMISSION_FLAG = ENV.get("PERMISSION_FLAG", "--dangerously-skip-permissions")
-CONTEXT_WINDOW = int(ENV.get("CONTEXT_WINDOW", "200000"))
+CONTEXT_WINDOW_DEFAULT = int(ENV.get("CONTEXT_WINDOW", "200000"))
 
 API = f"https://api.telegram.org/bot{TOKEN}"
+
+
+def context_window(model):
+    """Best-effort context window for the active model.
+
+    A CONTEXT_WINDOW env value forces a fixed window; otherwise derive it from
+    the model name. Claude 4.x Opus/Sonnet run with a 1M window here, so the old
+    hardcoded 200k denominator made the fill % overshoot past 100%.
+    """
+    if ENV.get("CONTEXT_WINDOW"):
+        return CONTEXT_WINDOW_DEFAULT
+    m = (model or "").lower()
+    if "opus-4" in m or "sonnet-4" in m:
+        return 1_000_000
+    return CONTEXT_WINDOW_DEFAULT
 
 
 def ctx_tokens(usage):
@@ -292,8 +307,9 @@ def handle_message(state, chat_id, text):
         m = state.get("last_model") or "(unknown — send a message first)"
         used = ctx_tokens(state.get("last_usage"))
         if used:
-            pct = 100 * used // CONTEXT_WINDOW
-            ctx_line = f"context: {used:,} / {CONTEXT_WINDOW:,} ({pct}%)"
+            window = context_window(state.get("last_model"))
+            pct = min(100, 100 * used // window)
+            ctx_line = f"context: {used:,} / {window:,} ({pct}%)"
         else:
             ctx_line = "context: (no turn recorded yet)"
         send_message(chat_id, f"model: {m}\n{ctx_line}\nsession: {state.get('session_id') or '(new)'}")
@@ -321,8 +337,10 @@ def handle_message(state, chat_id, text):
 
     # one-time nudge as the context window fills up
     used = ctx_tokens(usage)
-    if used >= 0.8 * CONTEXT_WINDOW and not state.get("ctx_warned"):
-        send_message(chat_id, f"⚠️ context {100 * used // CONTEXT_WINDOW}% full — consider /new soon to stay sharp.")
+    window = context_window(model or state.get("last_model"))
+    if used >= 0.8 * window and not state.get("ctx_warned"):
+        pct = min(100, 100 * used // window)
+        send_message(chat_id, f"⚠️ context {pct}% full — consider /new soon to stay sharp.")
         state["ctx_warned"] = True
         save_state(state)
 
