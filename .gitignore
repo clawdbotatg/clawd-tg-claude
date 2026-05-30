@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Runtime state & logs
+state.json
+*.log
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+Telegram <-> Claude Code bridge (streaming).
+
+Talk to Claude Code from Telegram like a CLI chat:
+  - every message you send is fed to `claude -p` and the reply STREAMS back live
+  - text appears in a live-updating Telegram message as Claude writes it
+  - tool activity (Bash, Edit, ...) shows as status lines so you see what it's doing
+  - the conversation persists (session is resumed); /new starts fresh
+
+Runs on your Claude subscription (NOT the API): ANTHROPIC_API_KEY is stripped
+from the child env. Pure Python stdlib. No pip installs.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_PATH = os.path.join(HERE, "state.json")
+ENV_PATH = os.path.join(HERE, ".env")
+
+
+# ----------------------------- config -----------------------------
+
+def load_env(path):
+    vals = {}
+    if not os.path.exists(path):
+        return vals
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+    return vals
+
+
+ENV = load_env(ENV_PATH)
+TOKEN = ENV.get("TELEGRAM_BOT_TOKEN", "")
+ALLOWED_CHAT_ID = str(ENV.get("ALLOWED_CHAT_ID", "")).strip()
+WORKDIR = ENV.get("WORKDIR") or HERE
+CLAUDE_BIN = ENV.get("CLAUDE_BIN") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+PERMISSION_FLAG = ENV.get("PERMISSION_FLAG", "--dangerously-skip-permissions")
+
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+
+# ----------------------------- state ------------------------------
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"session_id": None}
+
+
+def save_state(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+# --------------------------- telegram api -------------------------
+
+def api_call(method, **params):
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(f"{API}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def send_message(chat_id, text):
+    if not text:
+        return None
+    r = api_call("sendMessage", chat_id=chat_id, text=text[:4096])
+    return r.get("result", {}).get("message_id") if r.get("ok") else None
+
+
+def edit_message(chat_id, message_id, text):
+    r = api_call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:4096])
+    return bool(r.get("ok"))
+
+
+def send_action(chat_id, action="typing"):
+    api_call("sendChatAction", chat_id=chat_id, action=action)
+
+
+def tg_poll(offset, timeout=30):
+    url = f"{API}/getUpdates?timeout={timeout}&offset={offset}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout + 15) as resp:
+        return json.load(resp)
+
+
+# --------------------------- streamer -----------------------------
+
+class Streamer:
+    """Streams text into a live-updating Telegram message, throttled.
+
+    A 'bubble' is one Telegram message. Text accumulates and we edit the
+    bubble in place. When a tool runs (or the bubble gets too long) we
+    finalize it and the next text starts a fresh bubble.
+    """
+
+    MIN_EDIT_INTERVAL = 1.2   # seconds between edits (Telegram-friendly)
+    LIMIT = 3900              # split bubbles before Telegram's 4096 cap
+
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.msg_id = None
+        self.buf = ""
+        self.rendered = ""
+        self.last_edit = 0.0
+        self.sent_anything = False
+
+    def feed(self, text):
+        self.buf += text
+        while len(self.buf) > self.LIMIT:
+            cut = self.buf.rfind("\n", 0, self.LIMIT)
+            if cut <= 0:
+                cut = self.LIMIT
+            head, self.buf = self.buf[:cut], self.buf[cut:].lstrip("\n")
+            self._push(head, force=True)
+            self._new_bubble()
+        self._push(self.buf)
+
+    def _new_bubble(self):
+        self.msg_id = None
+        self.rendered = ""
+        self.last_edit = 0.0
+
+    def _push(self, text, force=False):
+        text = text.strip("\n")
+        if not text:
+            return
+        now = time.time()
+        if not force and (now - self.last_edit) < self.MIN_EDIT_INTERVAL:
+            return
+        if text == self.rendered:
+            return
+        if self.msg_id is None:
+            self.msg_id = send_message(self.chat_id, text)
+            self.rendered = text
+        elif edit_message(self.chat_id, self.msg_id, text):
+            self.rendered = text
+        self.last_edit = now
+        self.sent_anything = True
+
+    def block_done(self):
+        """End of a text block: push the final state of the current bubble."""
+        if self.buf.strip():
+            self._push(self.buf, force=True)
+
+    def end_bubble(self):
+        """Finalize current bubble; next text starts a new one."""
+        self.block_done()
+        self._new_bubble()
+        self.buf = ""
+
+    def status(self, text):
+        self.end_bubble()
+        send_message(self.chat_id, text)
+        self.sent_anything = True
+
+
+# ----------------------------- claude -----------------------------
+
+TOOL_EMOJI = {
+    "Bash": "💻", "Edit": "✏️", "Write": "📝", "Read": "📖",
+    "Grep": "🔎", "Glob": "🔎", "WebFetch": "🌐", "WebSearch": "🌐",
+    "Task": "🤖", "TodoWrite": "✅",
+}
+
+
+def stream_claude(streamer, prompt, session_id):
+    """Run one headless turn, streaming output to `streamer`.
+    Returns (new_session_id, ok)."""
+    cmd = [
+        CLAUDE_BIN, "-p", prompt,
+        "--output-format", "stream-json", "--verbose",
+        "--include-partial-messages", PERMISSION_FLAG,
+    ]
+    if session_id:
+        cmd += ["--resume", session_id]
+
+    child_env = dict(os.environ)
+    child_env.pop("ANTHROPIC_API_KEY", None)
+
+    proc = subprocess.Popen(
+        cmd, cwd=WORKDIR, env=child_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    killer = threading.Timer(1800, proc.kill)
+    killer.start()
+
+    new_sid = session_id
+    is_error = False
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+
+            t = ev.get("type")
+            if ev.get("session_id"):
+                new_sid = ev["session_id"]
+
+            if t == "stream_event":
+                inner = ev.get("event", {})
+                et = inner.get("type")
+                if et == "content_block_start":
+                    cb = inner.get("content_block", {})
+                    if cb.get("type") == "tool_use":
+                        name = cb.get("name", "tool")
+                        emoji = TOOL_EMOJI.get(name, "🔧")
+                        streamer.status(f"{emoji} {name}…")
+                        send_action(streamer.chat_id)
+                elif et == "content_block_delta":
+                    delta = inner.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        streamer.feed(delta.get("text", ""))
+                elif et == "content_block_stop":
+                    streamer.block_done()
+            elif t == "result":
+                is_error = bool(ev.get("is_error"))
+                if ev.get("result") and not streamer.sent_anything:
+                    streamer.feed(ev["result"])
+    finally:
+        killer.cancel()
+        proc.wait()
+        streamer.end_bubble()
+
+    if proc.returncode != 0 or is_error:
+        return (new_sid, False)
+    return (new_sid, True)
+
+
+# ------------------------------ main ------------------------------
+
+def handle_message(state, chat_id, text):
+    cmd = text.strip().lower()
+
+    if cmd in ("/new", "/clear", "/reset"):
+        state["session_id"] = None
+        save_state(state)
+        send_message(chat_id, "🧹 Fresh session started. Context cleared (memory + CLAUDE.md still loaded).")
+        return
+    if cmd == "/start":
+        send_message(chat_id, "👋 Connected to Claude Code. Just talk to me. /new starts a clean session.")
+        return
+    if cmd == "/whoami":
+        send_message(chat_id, f"chat_id: {chat_id}\nsession: {state.get('session_id') or '(new)'}\nworkdir: {WORKDIR}")
+        return
+
+    send_action(chat_id)
+    streamer = Streamer(chat_id)
+    sid, ok = stream_claude(streamer, text, state.get("session_id"))
+
+    if not ok and state.get("session_id"):
+        # resume probably failed; retry once with a fresh session
+        send_message(chat_id, "(session expired — starting fresh)")
+        streamer = Streamer(chat_id)
+        sid, ok = stream_claude(streamer, text, None)
+
+    state["session_id"] = sid
+    save_state(state)
+
+    if not streamer.sent_anything:
+        send_message(chat_id, "(no output)" if ok else "(error — check tg-agent.log)")
+
+
+def main():
+    if not TOKEN:
+        sys.exit("Missing TELEGRAM_BOT_TOKEN in .env")
+    if not os.path.exists(CLAUDE_BIN):
+        sys.exit(f"claude binary not found at {CLAUDE_BIN}")
+
+    state = load_state()
+    print(f"[tg-agent] up. workdir={WORKDIR} claude={CLAUDE_BIN}", flush=True)
+    print(f"[tg-agent] allowed chat: {ALLOWED_CHAT_ID or '(ANY - set ALLOWED_CHAT_ID!)'}", flush=True)
+
+    offset = 0
+    while True:
+        try:
+            data = tg_poll(offset)
+        except Exception as e:
+            print(f"[poll error] {e}", file=sys.stderr, flush=True)
+            time.sleep(3)
+            continue
+
+        for upd in data.get("result", []):
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg or "text" not in msg:
+                continue
+            chat_id = str(msg["chat"]["id"])
+
+            if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+                print(f"[ignored] unauthorized chat {chat_id}", flush=True)
+                continue
+
+            print(f"[msg from {chat_id}] {msg['text'][:80]}", flush=True)
+            try:
+                handle_message(state, chat_id, msg["text"])
+            except Exception as e:
+                print(f"[handle error] {e}", file=sys.stderr, flush=True)
+                send_message(chat_id, f"(bridge error: {e})")
+
+
+if __name__ == "__main__":
+    main()
