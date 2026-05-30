@@ -49,8 +49,18 @@ ALLOWED_CHAT_ID = str(ENV.get("ALLOWED_CHAT_ID", "")).strip()
 WORKDIR = ENV.get("WORKDIR") or HERE
 CLAUDE_BIN = ENV.get("CLAUDE_BIN") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 PERMISSION_FLAG = ENV.get("PERMISSION_FLAG", "--dangerously-skip-permissions")
+CONTEXT_WINDOW = int(ENV.get("CONTEXT_WINDOW", "200000"))
 
 API = f"https://api.telegram.org/bot{TOKEN}"
+
+
+def ctx_tokens(usage):
+    """Approx tokens occupying the context window for a turn."""
+    if not usage:
+        return 0
+    return (usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0))
 
 
 # ----------------------------- state ------------------------------
@@ -209,6 +219,8 @@ def stream_claude(streamer, prompt, session_id):
 
     new_sid = session_id
     is_error = False
+    model = None
+    usage = None
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -222,6 +234,11 @@ def stream_claude(streamer, prompt, session_id):
             t = ev.get("type")
             if ev.get("session_id"):
                 new_sid = ev["session_id"]
+            if not model:
+                model = ev.get("model") or (ev.get("message") or {}).get("model")
+            u = ev.get("usage") or (ev.get("message") or {}).get("usage")
+            if u:
+                usage = u
 
             if t == "stream_event":
                 inner = ev.get("event", {})
@@ -249,8 +266,8 @@ def stream_claude(streamer, prompt, session_id):
         streamer.end_bubble()
 
     if proc.returncode != 0 or is_error:
-        return (new_sid, False)
-    return (new_sid, True)
+        return (new_sid, False, model, usage)
+    return (new_sid, True, model, usage)
 
 
 # ------------------------------ main ------------------------------
@@ -260,6 +277,8 @@ def handle_message(state, chat_id, text):
 
     if cmd in ("/new", "/clear", "/reset"):
         state["session_id"] = None
+        state.pop("last_usage", None)
+        state["ctx_warned"] = False
         save_state(state)
         send_message(chat_id, "🧹 Fresh session started. Context cleared (memory + CLAUDE.md still loaded).")
         return
@@ -269,22 +288,43 @@ def handle_message(state, chat_id, text):
     if cmd == "/whoami":
         send_message(chat_id, f"chat_id: {chat_id}\nsession: {state.get('session_id') or '(new)'}\nworkdir: {WORKDIR}")
         return
+    if cmd == "/status":
+        m = state.get("last_model") or "(unknown — send a message first)"
+        used = ctx_tokens(state.get("last_usage"))
+        if used:
+            pct = 100 * used // CONTEXT_WINDOW
+            ctx_line = f"context: {used:,} / {CONTEXT_WINDOW:,} ({pct}%)"
+        else:
+            ctx_line = "context: (no turn recorded yet)"
+        send_message(chat_id, f"model: {m}\n{ctx_line}\nsession: {state.get('session_id') or '(new)'}")
+        return
 
     send_action(chat_id)
     streamer = Streamer(chat_id)
-    sid, ok = stream_claude(streamer, text, state.get("session_id"))
+    sid, ok, model, usage = stream_claude(streamer, text, state.get("session_id"))
 
     if not ok and state.get("session_id"):
         # resume probably failed; retry once with a fresh session
         send_message(chat_id, "(session expired — starting fresh)")
         streamer = Streamer(chat_id)
-        sid, ok = stream_claude(streamer, text, None)
+        sid, ok, model, usage = stream_claude(streamer, text, None)
 
     state["session_id"] = sid
+    if model:
+        state["last_model"] = model
+    if usage:
+        state["last_usage"] = usage
     save_state(state)
 
     if not streamer.sent_anything:
         send_message(chat_id, "(no output)" if ok else "(error — check tg-agent.log)")
+
+    # one-time nudge as the context window fills up
+    used = ctx_tokens(usage)
+    if used >= 0.8 * CONTEXT_WINDOW and not state.get("ctx_warned"):
+        send_message(chat_id, f"⚠️ context {100 * used // CONTEXT_WINDOW}% full — consider /new soon to stay sharp.")
+        state["ctx_warned"] = True
+        save_state(state)
 
 
 def main():
