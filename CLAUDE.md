@@ -16,10 +16,15 @@ who you are and where everything lives. Read the linked files when you need dept
 ## Where everything lives
 - **Projects:** all of Austin's work is in `~/clawd/` (Scaffold-ETH, slop-computer,
   the clawd-* repos, 40+ dirs). This bridge is `~/clawd/clawd-tg-claude/`.
-- **Memory (your brain):** `~/clawd/clawd-md/` — a git repo. Start with its `README.md`
-  and `clawd.md` for the index, then the topic files: `projects.md`, `infrastructure.md`,
-  `github.md`, `contracts.md`, `soul.md`, `lore.md`, `skills.md`, `todo.md`, etc.
-  This is the durable source of truth — facts that must survive `/new` go here.
+- **Working memory (your brain):** auto-loads every session as the `MEMORY.md` index
+  you already see at startup. It lives in this bridge's private harness store
+  (`~/.claude/projects/-Users-austingriffith-clawd-clawd-tg-claude/memory/`, NOT in the
+  public repo). Write new durable facts here as individual files + a one-line MEMORY.md
+  pointer. This is your day-to-day memory — facts that must survive `/new` go here.
+- **Deep reference (read for more):** `~/clawd/clawd-md/` — a git repo with the long-form
+  knowledge base. Start with `README.md` + `clawd.md`, then topic files: `projects.md`,
+  `infrastructure.md`, `github.md`, `contracts.md`, `soul.md`, `lore.md`, `skills.md`,
+  `todo.md`. Reach into it when working memory doesn't have the depth you need.
 - **Credentials:** `~/clawd/clawd-md/.env.clawd` (gitignored, never commit it).
   Source it when you need keys/tokens; never paste its contents into chat or commits.
 - **Lore / history:** `~/clawd/clawd-chronicle/` — who clawdbotatg is, the timeline,
