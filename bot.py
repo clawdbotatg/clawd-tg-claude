@@ -12,8 +12,10 @@ Runs on your Claude subscription (NOT the API): ANTHROPIC_API_KEY is stripped
 from the child env. Pure Python stdlib. No pip installs.
 """
 
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -107,15 +109,55 @@ def api_call(method, **params):
         return {"ok": False, "error": str(e)}
 
 
+def md_to_html(text):
+    """Render the subset of Markdown that survives Telegram's HTML parse_mode.
+
+    Only *paired* delimiters become tags, so a half-streamed '**foo' stays a
+    literal (escaped) until its closer arrives — the emitted HTML is always
+    balanced. Telegram supports <b> <i> <code> <pre> <a>; headers/bullets have
+    no tag, so we fold them into bold lines / bullet chars.
+    """
+    if not text:
+        return text
+    stash = []
+
+    def keep(rendered):
+        stash.append(rendered)
+        return f"\x00{len(stash) - 1}\x00"
+
+    # Pull code out first (before escaping) so its contents aren't markdown-parsed.
+    text = re.sub(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", lambda m: keep(f"<pre>{html.escape(m.group(1))}</pre>"), text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m.group(1))}</code>"), text)
+
+    text = html.escape(text)
+
+    # [label](url) — url already escaped above (&->&amp;), which is valid in an attr.
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
+    # bold before italic so ** isn't eaten by the single-* rule
+    text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__([^\n]+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"^\s*#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.M)
+    text = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", text, flags=re.M)
+
+    for i, rep in enumerate(stash):
+        text = text.replace(f"\x00{i}\x00", rep)
+    return text
+
+
 def send_message(chat_id, text):
     if not text:
         return None
-    r = api_call("sendMessage", chat_id=chat_id, text=text[:4096])
+    r = api_call("sendMessage", chat_id=chat_id, text=md_to_html(text)[:4096], parse_mode="HTML")
+    if not r.get("ok"):  # bad HTML / truncated tag — never drop the message
+        r = api_call("sendMessage", chat_id=chat_id, text=text[:4096])
     return r.get("result", {}).get("message_id") if r.get("ok") else None
 
 
 def edit_message(chat_id, message_id, text):
-    r = api_call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:4096])
+    r = api_call("editMessageText", chat_id=chat_id, message_id=message_id, text=md_to_html(text)[:4096], parse_mode="HTML")
+    if not r.get("ok"):
+        r = api_call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:4096])
     return bool(r.get("ok"))
 
 
@@ -141,7 +183,7 @@ class Streamer:
     """
 
     MIN_EDIT_INTERVAL = 1.2   # seconds between edits (Telegram-friendly)
-    LIMIT = 3900              # split bubbles before Telegram's 4096 cap
+    LIMIT = 3500              # split bubbles below Telegram's 4096 cap (HTML escaping/tags expand the source)
 
     def __init__(self, chat_id):
         self.chat_id = chat_id
