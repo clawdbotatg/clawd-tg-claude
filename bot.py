@@ -131,13 +131,21 @@ def md_to_html(text):
 
     text = html.escape(text)
 
-    # [label](url) — url already escaped above (&->&amp;), which is valid in an attr.
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
-    # bold before italic so ** isn't eaten by the single-* rule
-    text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__([^\n]+?)__", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"^\s*#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.M)
+    # Stash links BEFORE emphasis so * / _ inside a URL or label can't be mangled.
+    # url is already escaped above (&->&amp;), which is valid inside an href attr.
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", lambda m: keep(f'<a href="{m.group(2)}">{m.group(1)}</a>'), text)
+
+    # Emphasis: only *paired* delimiters become tags, so output is always balanced
+    # and a half-streamed '**foo' stays a literal until its closer arrives.
+    text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)                      # **bold**
+    text = re.sub(r"(?<!\w)__([^\n]+?)__(?!\w)", r"<b>\1</b>", text)            # __bold__
+    text = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)      # *italic*
+    text = re.sub(r"(?<!\w)_(?!_)([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)        # _italic_ (not snake_case)
+    text = re.sub(r"~~([^\n]+?)~~", r"<s>\1</s>", text)                          # ~~strike~~
+
+    # Headers -> bold line (drop the #'s); strip any inner <b> so we don't nest.
+    text = re.sub(r"^\s*#{1,6}\s+(.+)$", lambda m: "<b>" + re.sub(r"</?b>", "", m.group(1)) + "</b>", text, flags=re.M)
+    # Bullets -> • (also numbered list markers kept as-is by not matching them)
     text = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", text, flags=re.M)
 
     for i, rep in enumerate(stash):
